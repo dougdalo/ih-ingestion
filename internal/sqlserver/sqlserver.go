@@ -138,6 +138,27 @@ ORDER BY ORDINAL_POSITION;
 	return cols, nil
 }
 
+func GetTableRowCount(db *sql.DB, schema, table string) (int64, error) {
+	const q = `
+SELECT
+  SUM(p.rows) AS row_count
+FROM sys.tables t
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+JOIN sys.dm_db_partition_stats p ON t.object_id = p.object_id
+WHERE p.index_id IN (0,1)
+  AND s.name = @p1
+  AND t.name = @p2;
+`
+	var rowCount sql.NullInt64
+	if err := db.QueryRow(q, schema, table).Scan(&rowCount); err != nil {
+		return 0, err
+	}
+	if !rowCount.Valid {
+		return 0, nil
+	}
+	return rowCount.Int64, nil
+}
+
 func mapToSnowflakeType(c model.ColumnInfo) string {
 	t := strings.ToLower(c.DataType)
 

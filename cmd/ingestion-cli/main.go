@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -15,6 +16,18 @@ import (
 	"ih-ingestion/internal/sqlserver"
 	"ih-ingestion/internal/templates"
 )
+
+type tableMeta struct {
+	Name        string
+	Schema      string
+	RowCount    int64
+	BusinessDDL string
+}
+
+type sourceGroup struct {
+	Tables    []tableMeta
+	TotalRows int64
+}
 
 func main() {
 	// Carrega .env se existir
@@ -30,14 +43,19 @@ func main() {
 	outDir := flag.String("out", ".", "diretório de saída para os YAMLs")
 	dryRun := flag.Bool("dry-run", false, "se verdadeiro, não grava arquivos, apenas mostra o que seria gerado")
 
+	maxTablesPerSource := flag.Int("max-tables-per-source", 0, "máximo de tabelas por source connector (0 = ilimitado, pode ser sobrescrito por alias no YAML)")
+	maxRowsPerSource := flag.Int64("max-rows-per-source", 0, "máximo de linhas totais por source connector (0 = ignorar rowcount, pode ser sobrescrito por alias no YAML)")
+
 	flag.Parse()
 
 	// Modo multi-banco/multi-tabela via YAML
 	if *configPath != "" {
-		log.Printf("Iniciando modo config: configPath=%s group=%s mode=%s size=%s outDir=%s dryRun=%v",
-			*configPath, *group, *mode, *size, *outDir, *dryRun)
+		log.Printf(
+			"Iniciando modo config: configPath=%s group=%s mode=%s size=%s outDir=%s dryRun=%v maxTablesPerSource(flag)=%d maxRowsPerSource(flag)=%d",
+			*configPath, *group, *mode, *size, *outDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource,
+		)
 
-		if err := runFromConfig(*configPath, *group, *mode, *size, *outDir, *dryRun); err != nil {
+		if err := runFromConfig(*configPath, *group, *mode, *size, *outDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource); err != nil {
 			log.Fatalf("erro no modo config: %v", err)
 		}
 		return
@@ -200,8 +218,8 @@ func runSingleTable(schema, table, group, mode, size, outDir string, dryRun bool
 	return nil
 }
 
-// Modo YAML: vários bancos/tabelas via ingestion.yaml
-func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool) error {
+// Modo YAML: vários bancos/tabelas via ingestion.yaml, com agrupamento em sources
+func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, maxTablesPerSourceFlag int, maxRowsPerSourceFlag int64) error {
 	cfgYaml, err := config.LoadIngestionConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("carregando config YAML: %w", err)
@@ -230,13 +248,24 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool) er
 	shBootstrap := config.GetEnvOrDefault("SCHEMA_HISTORY_BOOTSTRAP_SERVERS", "kafka01:9092,kafka02:9092,kafka03:9092")
 
 	totalTables := 0
+	totalSources := 0
 
 	for _, srv := range cfgYaml.SqlServers {
 		dbNameLower := strings.ToLower(srv.Database)
 		dbNameUpper := strings.ToUpper(srv.Database)
 
-		log.Printf("[alias=%s] database=%s schemaDefault=%s tables=%d",
-			srv.Alias, dbNameUpper, srv.Schema, len(srv.Tables))
+		// limites efetivos (YAML > flag > 0)
+		effMaxTables := maxTablesPerSourceFlag
+		if srv.MaxTablesPerSource > 0 {
+			effMaxTables = srv.MaxTablesPerSource
+		}
+		effMaxRows := maxRowsPerSourceFlag
+		if srv.MaxRowsPerSource > 0 {
+			effMaxRows = srv.MaxRowsPerSource
+		}
+
+		log.Printf("[alias=%s] database=%s schemaDefault=%s tables=%d maxTables=%d maxRows=%d",
+			srv.Alias, dbNameUpper, srv.Schema, len(srv.Tables), effMaxTables, effMaxRows)
 
 		// Conecta por alias
 		db, err := sqlserver.NewFromAlias(srv.Alias, srv.Database)
@@ -244,39 +273,64 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool) er
 			return fmt.Errorf("conectando alias %s: %w", srv.Alias, err)
 		}
 
+		// Monta metadados de cada tabela (DDL + rowcount)
+		var metas []tableMeta
 		for _, t := range srv.Tables {
-			totalTables++
-
-			tableName := t.Name
-			tableUpper := strings.ToUpper(tableName)
-			tableLower := strings.ToLower(tableName)
-
 			schema := srv.Schema
 			if strings.TrimSpace(t.Schema) != "" {
-				schema = t.Schema
+				schema = strings.TrimSpace(t.Schema)
 			}
-			schemaLower := strings.ToLower(schema)
 
-			cols, err := sqlserver.LoadColumns(db, schema, tableName)
+			cols, err := sqlserver.LoadColumns(db, schema, t.Name)
 			if err != nil {
 				db.Close()
-				return fmt.Errorf("lendo colunas %s.%s (%s): %w", schema, tableName, srv.Alias, err)
+				return fmt.Errorf("lendo colunas %s.%s (%s): %w", schema, t.Name, srv.Alias, err)
 			}
-
 			businessDDL := sqlserver.BuildBusinessColumnsDDL(cols)
 
-			// Source
+			var rowCount int64
+			if effMaxRows > 0 {
+				rowCount, err = sqlserver.GetTableRowCount(db, schema, t.Name)
+				if err != nil {
+					db.Close()
+					return fmt.Errorf("obtendo rowcount de %s.%s (%s): %w", schema, t.Name, srv.Alias, err)
+				}
+			}
+
+			metas = append(metas, tableMeta{
+				Name:        t.Name,
+				Schema:      schema,
+				RowCount:    rowCount,
+				BusinessDDL: businessDDL,
+			})
+			totalTables++
+		}
+
+		groups := groupTablesIntoSources(metas, effMaxTables, effMaxRows)
+		log.Printf("[alias=%s] grupos de source criados: %d (maxTables=%d, maxRows=%d)",
+			srv.Alias, len(groups), effMaxTables, effMaxRows)
+
+		dbDefaultSchemaLower := strings.ToLower(strings.TrimSpace(srv.Schema))
+		if dbDefaultSchemaLower == "" {
+			dbDefaultSchemaLower = "dbo"
+		}
+
+		for gi, g := range groups {
+			totalSources++
+			groupIndex := gi + 1
+
+			// Naming base pra esse grupo
 			sourceName := fmt.Sprintf(
-				"source-debeziumsqlserver-%s-%s-%s-%s-%s",
-				dbNameLower, schemaLower, group, mode, size,
+				"source-debeziumsqlserver-%s-%s-%s-%s-%s-%03d",
+				dbNameLower, dbDefaultSchemaLower, group, mode, size, groupIndex,
 			)
 
 			topicPrefix := fmt.Sprintf(
 				"source_debeziumsqlserver_%s_%s_%s_%s_%s",
-				dbNameLower, schemaLower, group, mode, size,
+				dbNameLower, dbDefaultSchemaLower, group, mode, size,
 			)
 
-			schemaHistoryTopic := "sh_" + topicPrefix
+			schemaHistoryTopic := fmt.Sprintf("sh_%s_%03d", topicPrefix, groupIndex)
 
 			upperAlias := strings.ToUpper(srv.Alias)
 			hostEnvName := fmt.Sprintf("SQLSERVER_%s_HOST", upperAlias)
@@ -289,87 +343,112 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool) er
 			}
 			port := config.GetEnvOrDefault(portEnvName, "1433")
 
+			// table.include.list com todas as tabelas desse grupo
+			includeParts := make([]string, 0, len(g.Tables))
+			for _, tm := range g.Tables {
+				includeParts = append(includeParts, fmt.Sprintf("%s.%s", tm.Schema, tm.Name))
+			}
+			tableIncludeList := strings.Join(includeParts, ",")
+
 			sourceCfg := model.SourceConfig{
 				Name:                          sourceName,
 				ClusterName:                   clusterName,
 				DatabaseHost:                  host,
 				DatabasePort:                  port,
-				DatabaseSecret:                srv.SecretName, // secret específico desse banco
+				DatabaseSecret:                srv.SecretName,
 				DatabaseNameUpper:             dbNameUpper,
 				TopicPrefix:                   topicPrefix,
-				TableIncludeList:              fmt.Sprintf("%s.%s", schema, tableName),
+				TableIncludeList:              tableIncludeList,
 				SchemaHistoryBootstrapServers: shBootstrap,
 				SchemaHistoryTopic:            schemaHistoryTopic,
 			}
 
-			// Sink
-			topicName := fmt.Sprintf(
-				"%s.%s.%s.%s",
-				topicPrefix, dbNameUpper, strings.ToUpper(schema), tableUpper,
-			)
+			srcPath := fmt.Sprintf("%s/source-%s-%s-%03d.yaml", outDir, dbNameLower, dbDefaultSchemaLower, groupIndex)
 
-			sinkName := fmt.Sprintf(
-				"sink-jdbcsnowflake-%s-%s-%s-%s-%s-%s",
-				logicalDB,
-				dbNameLower,
-				tableLower,
-				mode,
-				size,
-				"v1",
-			)
-
-			sinkCfg := model.SinkConfig{
-				Name:                    sinkName,
-				ClusterName:             clusterName,
-				TopicName:               topicName,
-				SnowflakeURL:            snowJdbc,
-				SnowflakeUserSecret:     snowUserSecret,
-				SnowflakePasswordSecret: snowPassSecret,
-				Stage:                   tableUpper,
-				Table:                   tableUpper,
-				Schema:                  dbNameUpper,
+			logPrefix := fmt.Sprintf("[alias=%s grp=%02d db=%s]", srv.Alias, groupIndex, dbNameUpper)
+			log.Printf("%s source=%s (tables=%d, totalRows=%d) -> %s",
+				logPrefix, sourceName, len(g.Tables), g.TotalRows, srcPath)
+			for _, tm := range g.Tables {
+				log.Printf("%s   table=%s.%s rows=%d", logPrefix, tm.Schema, strings.ToUpper(tm.Name), tm.RowCount)
 			}
 
-			// Job Snowflake
-			jobName := fmt.Sprintf("lz-sql-ih-%s-%s-v1", dbNameLower, tableLower)
-			sqlConfigMapName := fmt.Sprintf("lz-sql-ih-%s-%s-sql", dbNameLower, tableLower)
-
-			jobCfg := model.SnowflakeJobConfig{
-				JobName:             jobName,
-				ConnectionConfigMap: connCfgMap,
-				SqlConfigMapName:    sqlConfigMapName,
-				Role:                role,
-				Database:            sfDatabase,
-				Schema:              dbNameUpper,
-				TableIngest:         fmt.Sprintf("%s_INGEST", tableUpper),
-				TableFinal:          tableUpper,
-				StageName:           tableUpper,
-				BusinessColumnsDDL:  businessDDL,
+			if !dryRun {
+				if err := generator.RenderToFile(templates.SourceTemplate, sourceCfg, srcPath); err != nil {
+					db.Close()
+					return fmt.Errorf("gerando source group %d (%s): %w", groupIndex, srv.Alias, err)
+				}
+			} else {
+				log.Printf("%s DRY-RUN: source NÃO gravado (apenas preview)", logPrefix)
 			}
 
-			srcPath := fmt.Sprintf("%s/source-%s-%s.yaml", outDir, dbNameLower, tableLower)
-			sinkPath := fmt.Sprintf("%s/sink-%s-%s.yaml", outDir, dbNameLower, tableLower)
-			jobPath := fmt.Sprintf("%s/job-snowflake-%s-%s.yaml", outDir, dbNameLower, tableLower)
+			// Agora sinks e jobs por tabela (1:1)
+			for _, tm := range g.Tables {
+				schema := tm.Schema
+				tableUpper := strings.ToUpper(tm.Name)
+				tableLower := strings.ToLower(tm.Name)
 
-			logPrefix := fmt.Sprintf("[alias=%s db=%s schema=%s table=%s]", srv.Alias, dbNameUpper, schema, tableUpper)
-			log.Printf("%s source=%s sink=%s job=%s", logPrefix, sourceName, sinkName, jobName)
+				topicName := fmt.Sprintf(
+					"%s.%s.%s.%s",
+					topicPrefix, dbNameUpper, strings.ToUpper(schema), tableUpper,
+				)
 
-			if dryRun {
-				log.Printf("%s DRY-RUN: arquivos seriam %s, %s, %s", logPrefix, srcPath, sinkPath, jobPath)
-				continue
-			}
+				sinkName := fmt.Sprintf(
+					"sink-jdbcsnowflake-%s-%s-%s-%s-%s-%s",
+					logicalDB,
+					dbNameLower,
+					tableLower,
+					mode,
+					size,
+					"v1",
+				)
 
-			if err := generator.RenderToFile(templates.SourceTemplate, sourceCfg, srcPath); err != nil {
-				db.Close()
-				return fmt.Errorf("gerando source (%s.%s): %w", schema, tableName, err)
-			}
-			if err := generator.RenderToFile(templates.SinkTemplate, sinkCfg, sinkPath); err != nil {
-				db.Close()
-				return fmt.Errorf("gerando sink (%s.%s): %w", schema, tableName, err)
-			}
-			if err := generator.RenderToFile(templates.SnowflakeJobTemplate, jobCfg, jobPath); err != nil {
-				db.Close()
-				return fmt.Errorf("gerando job (%s.%s): %w", schema, tableName, err)
+				sinkCfg := model.SinkConfig{
+					Name:                    sinkName,
+					ClusterName:             clusterName,
+					TopicName:               topicName,
+					SnowflakeURL:            snowJdbc,
+					SnowflakeUserSecret:     snowUserSecret,
+					SnowflakePasswordSecret: snowPassSecret,
+					Stage:                   tableUpper,
+					Table:                   tableUpper,
+					Schema:                  dbNameUpper,
+				}
+
+				jobName := fmt.Sprintf("lz-sql-ih-%s-%s-v1", dbNameLower, tableLower)
+				sqlConfigMapName := fmt.Sprintf("lz-sql-ih-%s-%s-sql", dbNameLower, tableLower)
+
+				jobCfg := model.SnowflakeJobConfig{
+					JobName:             jobName,
+					ConnectionConfigMap: connCfgMap,
+					SqlConfigMapName:    sqlConfigMapName,
+					Role:                role,
+					Database:            sfDatabase,
+					Schema:              dbNameUpper,
+					TableIngest:         fmt.Sprintf("%s_INGEST", tableUpper),
+					TableFinal:          tableUpper,
+					StageName:           tableUpper,
+					BusinessColumnsDDL:  tm.BusinessDDL,
+				}
+
+				sinkPath := fmt.Sprintf("%s/sink-%s-%s.yaml", outDir, dbNameLower, tableLower)
+				jobPath := fmt.Sprintf("%s/job-snowflake-%s-%s.yaml", outDir, dbNameLower, tableLower)
+
+				log.Printf("%s sink=%s job=%s table=%s.%s -> %s , %s",
+					logPrefix, sinkName, jobName, schema, tableUpper, sinkPath, jobPath)
+
+				if dryRun {
+					log.Printf("%s DRY-RUN: sink/job NÃO gravados (apenas preview)", logPrefix)
+					continue
+				}
+
+				if err := generator.RenderToFile(templates.SinkTemplate, sinkCfg, sinkPath); err != nil {
+					db.Close()
+					return fmt.Errorf("gerando sink (%s.%s): %w", schema, tm.Name, err)
+				}
+				if err := generator.RenderToFile(templates.SnowflakeJobTemplate, jobCfg, jobPath); err != nil {
+					db.Close()
+					return fmt.Errorf("gerando job (%s.%s): %w", schema, tm.Name, err)
+				}
 			}
 		}
 
@@ -377,10 +456,65 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool) er
 	}
 
 	if dryRun {
-		log.Printf("DRY-RUN concluído. Tabelas processadas (sem gerar arquivos): %d", totalTables)
+		log.Printf("DRY-RUN concluído. Sources simulados: %d | Tabelas processadas: %d", totalSources, totalTables)
 	} else {
-		log.Printf("Arquivos gerados em %s (modo config, vários bancos/tabelas). Tabelas processadas: %d", outDir, totalTables)
+		log.Printf("Arquivos gerados em %s (modo config). Sources: %d | Tabelas: %d", outDir, totalSources, totalTables)
 	}
 
 	return nil
+}
+
+// Agrupa as tabelas em grupos (cada grupo vira 1 source connector)
+func groupTablesIntoSources(tables []tableMeta, maxTables int, maxRows int64) []sourceGroup {
+	if len(tables) == 0 {
+		return nil
+	}
+
+	// Sem limites: tudo em um único source
+	if maxTables <= 0 && maxRows <= 0 {
+		g := sourceGroup{}
+		for _, t := range tables {
+			g.Tables = append(g.Tables, t)
+			g.TotalRows += t.RowCount
+		}
+		return []sourceGroup{g}
+	}
+
+	// Ordena por rowcount desc (tabelas maiores primeiro)
+	sort.Slice(tables, func(i, j int) bool {
+		return tables[i].RowCount > tables[j].RowCount
+	})
+
+	var groups []sourceGroup
+
+	for _, t := range tables {
+		placed := false
+
+		for gi := range groups {
+			// limite de tabelas
+			if maxTables > 0 && len(groups[gi].Tables) >= maxTables {
+				continue
+			}
+			// limite de linhas
+			if maxRows > 0 && groups[gi].TotalRows+t.RowCount > maxRows {
+				continue
+			}
+
+			groups[gi].Tables = append(groups[gi].Tables, t)
+			groups[gi].TotalRows += t.RowCount
+			placed = true
+			break
+		}
+
+		// se não coube em nenhum grupo existente, cria um novo
+		if !placed {
+			g := sourceGroup{
+				Tables:    []tableMeta{t},
+				TotalRows: t.RowCount,
+			}
+			groups = append(groups, g)
+		}
+	}
+
+	return groups
 }

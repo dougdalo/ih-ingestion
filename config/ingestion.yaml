@@ -3,6 +3,8 @@ sqlservers:
     database: demo_cdc
     schema: dbo                  # schema default das tabelas, se não for informado em cada uma
     secretName: sqlserver-origem-demo_cdc
+    maxTablesPerSource: 5        # até 5 tabelas por source
+    maxRowsPerSource: 50000000   # até 50M de linhas somadas por source
     tables:
       - name: Clientes
 
@@ -11,6 +13,8 @@ sqlservers:
     database: demo_cdc_2
     schema: dbo                  # schema default das tabelas, se não for informado em cada uma
     secretName: sqlserver-origem-demo_cdc_2
+    maxTablesPerSource: 5        # até 5 tabelas por source
+    maxRowsPerSource: 50000000   # até 50M de linhas somadas por source
     tables:
       - name: Clientes
 
@@ -18,6 +22,8 @@ sqlservers:
     database: demo_cdc_3
     schema: dbo                  # schema default das tabelas, se não for informado em cada uma
     secretName: sqlserver-origem-demo_cdc_3
+    maxTablesPerSource: 5        # até 5 tabelas por source
+    maxRowsPerSource: 50000000   # até 50M de linhas somadas por source
     tables:
       - name: Clientes
 
@@ -25,5 +31,7 @@ sqlservers:
     database: demo_cdc_4
     schema: dbo                  # schema default das tabelas, se não for informado em cada uma
     secretName: sqlserver-origem-demo_cdc_4
+    maxTablesPerSource: 5        # até 5 tabelas por source
+    maxRowsPerSource: 50000000   # até 50M de linhas somadas por source
     tables:
       - name: ClientesAtivos
