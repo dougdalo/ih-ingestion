@@ -1,0 +1,87 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lz-sql-ih-demo_cdc_2-clientes-v1
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ubuntu
+          image: ubuntu:20.04
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          command: ["bin/bash", "-c"]
+          volumeMounts:
+            - name: cfg
+              mountPath: /tmp/cfg
+              readOnly: true
+            - name: sql
+              mountPath: /tmp/sql/script.sql
+              subPath: script.sql
+              readOnly: true
+          args:
+            - |
+              apt-get update -y
+              apt-get install -y curl unzip
+
+              curl -o /tmp/snowsql-linux_x86_64.bash https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.3/linux_x86_64/snowsql-1.3.2-linux_x86_64.bash
+              SNOWSQL_DEST=~/bin SNOWSQL_LOGIN_SHELL=~/.bashrc bash /tmp/snowsql-linux_x86_64.bash
+
+              /root/bin/snowsql --config /tmp/cfg/snowsql.config --connection custom --filename /tmp/sql/script.sql
+      volumes:
+        - name: cfg
+          configMap:
+            name: lz-sql-ih-connection
+        - name: sql
+          configMap:
+            name: lz-sql-ih-demo_cdc_2-clientes-sql
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lz-sql-ih-demo_cdc_2-clientes-sql
+data:
+  script.sql: |
+    USE ROLE SNFLK_INTEGRATION_HUB_ROLE;
+    USE DATABASE LZ_SQL_IH;
+
+    CREATE SCHEMA IF NOT EXISTS DEMO_CDC_2;
+    USE SCHEMA DEMO_CDC_2;
+
+    DROP TABLE IF EXISTS CLIENTES_INGEST;
+    DROP TABLE IF EXISTS CLIENTES;
+
+    CREATE TABLE IF NOT EXISTS CLIENTES_INGEST (
+      Id INT NOT NULL,
+      Nome VARCHAR(100) NOT NULL,
+      Email VARCHAR(200) NULL,
+      DataCriacao TIMESTAMP_NTZ NOT NULL,
+      Ativo BOOLEAN NOT NULL,
+      IH_TOPIC VARCHAR(255) NOT NULL,
+      IH_PARTITION INT NOT NULL,
+      IH_OFFSET INT NOT NULL,
+      IH_OP VARCHAR(1) NOT NULL,
+      IH_DATETIME TIMESTAMP_NTZ NOT NULL,
+      IH_BLOCKID VARCHAR(40) NOT NULL,
+      constraint pkey PRIMARY KEY (IH_TOPIC, IH_PARTITION, IH_OFFSET)
+    );
+
+    CREATE TABLE IF NOT EXISTS CLIENTES (
+      Id INT NOT NULL,
+      Nome VARCHAR(100) NOT NULL,
+      Email VARCHAR(200) NULL,
+      DataCriacao TIMESTAMP_NTZ NOT NULL,
+      Ativo BOOLEAN NOT NULL,
+    );
+
+    CREATE OR REPLACE STAGE CLIENTES
+      FILE_FORMAT = (
+        TYPE = 'CSV',
+        FIELD_OPTIONALLY_ENCLOSED_BY = '"',
+        SKIP_HEADER = 0,
+        FIELD_DELIMITER = ';',
+        NULL_IF = ('\\N', 'NULL')
+      );

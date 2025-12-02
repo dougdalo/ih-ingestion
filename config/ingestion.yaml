@@ -1,0 +1,29 @@
+sqlservers:
+  - alias: demo_cdc
+    database: demo_cdc
+    schema: dbo                  # schema default das tabelas, se não for informado em cada uma
+    secretName: sqlserver-origem-demo_cdc
+    tables:
+      - name: Clientes
+
+
+  - alias: demo_cdc_2
+    database: demo_cdc_2
+    schema: dbo                  # schema default das tabelas, se não for informado em cada uma
+    secretName: sqlserver-origem-demo_cdc_2
+    tables:
+      - name: Clientes
+
+  - alias: demo_cdc_3
+    database: demo_cdc_3
+    schema: dbo                  # schema default das tabelas, se não for informado em cada uma
+    secretName: sqlserver-origem-demo_cdc_3
+    tables:
+      - name: Clientes
+
+  - alias: demo_cdc_4
+    database: demo_cdc_4
+    schema: dbo                  # schema default das tabelas, se não for informado em cada uma
+    secretName: sqlserver-origem-demo_cdc_4
+    tables:
+      - name: ClientesAtivos
