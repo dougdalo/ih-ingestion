@@ -32,6 +32,11 @@ sqlservers:
     schema: dbo                  # schema default das tabelas, se não for informado em cada uma
     secretName: sqlserver-origem-demo_cdc_4
     maxTablesPerSource: 5        # até 5 tabelas por source
-    maxRowsPerSource: 50000000   # até 50M de linhas somadas por source
+    maxRowsPerSource: 30   # até 50M de linhas somadas por source
     tables:
       - name: ClientesAtivos
+      - name: ClientesAtivosDados
+      - name: ClientesAtivosDadosValidos
+      - name: ClientesAtivosD
+      - name: ClientesAtivosDV
+      - name: ClientesAtivosDVA

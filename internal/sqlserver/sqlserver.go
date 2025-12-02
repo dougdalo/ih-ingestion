@@ -141,10 +141,10 @@ ORDER BY ORDINAL_POSITION;
 func GetTableRowCount(db *sql.DB, schema, table string) (int64, error) {
 	const q = `
 SELECT
-  SUM(p.rows) AS row_count
-FROM sys.tables t
-JOIN sys.schemas s ON t.schema_id = s.schema_id
-JOIN sys.dm_db_partition_stats p ON t.object_id = p.object_id
+  SUM(p.row_count) AS row_count
+FROM sys.dm_db_partition_stats AS p
+JOIN sys.tables t   ON p.object_id = t.object_id
+JOIN sys.schemas s  ON t.schema_id = s.schema_id
 WHERE p.index_id IN (0,1)
   AND s.name = @p1
   AND t.name = @p2;
