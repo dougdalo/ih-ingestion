@@ -1,10 +1,11 @@
-// cmd/ingestion-cli/main.go
 package main
 
 import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -12,6 +13,7 @@ import (
 
 	"ih-ingestion/internal/config"
 	"ih-ingestion/internal/generator"
+	"ih-ingestion/internal/gitops"
 	"ih-ingestion/internal/model"
 	"ih-ingestion/internal/sqlserver"
 	"ih-ingestion/internal/templates"
@@ -30,46 +32,115 @@ type sourceGroup struct {
 }
 
 func main() {
-	// Carrega .env se existir
-	_ = godotenv.Load()
+	// Descobre o diretório do executável
+	execPath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("erro ao obter caminho do executável: %v", err)
+	}
+	execDir := filepath.Dir(execPath)
+
+	// Carrega .env da pasta do executável (se existir)
+	envPath := filepath.Join(execDir, ".env")
+	_ = godotenv.Load(envPath)
 
 	// Flags
-	configPath := flag.String("config", "", "caminho para arquivo YAML de ingestão (vários bancos/tabelas)")
+	configFlag := flag.String("config", "", "caminho para arquivo YAML de ingestão (vários bancos/tabelas). Se vazio, tenta ingestion.yaml ao lado do binário")
 	schema := flag.String("schema", "dbo", "schema da tabela de origem (modo single)")
 	table := flag.String("table", "", "nome da tabela de origem (modo single)")
-	group := flag.String("group", "grupo1", "nome do grupo de tabelas para o source")
+	group := flag.String("group", "grupo1", "nome lógico do grupo/wave de tabelas")
 	mode := flag.String("mode", "online", "modo: online ou batch")
 	size := flag.String("size", "m", "tamanho: p/m/g")
-	outDir := flag.String("out", ".", "diretório de saída para os YAMLs")
-	dryRun := flag.Bool("dry-run", false, "se verdadeiro, não grava arquivos, apenas mostra o que seria gerado")
+	outDirFlag := flag.String("out", "./out", "diretório de saída para os YAMLs (se GitOps estiver habilitado, é relativo à raiz do repo)")
+	dryRun := flag.Bool("dry-run", false, "se verdadeiro, não grava arquivos nem faz git push; apenas mostra o que seria feito")
 
 	maxTablesPerSource := flag.Int("max-tables-per-source", 0, "máximo de tabelas por source connector (0 = ilimitado, pode ser sobrescrito por alias no YAML)")
 	maxRowsPerSource := flag.Int64("max-rows-per-source", 0, "máximo de linhas totais por source connector (0 = ignorar rowcount, pode ser sobrescrito por alias no YAML)")
 
 	flag.Parse()
 
-	// Modo multi-banco/multi-tabela via YAML
-	if *configPath != "" {
+	// Resolve configPath: flag > ingestion.yaml ao lado do binário
+	finalConfigPath := *configFlag
+	if finalConfigPath == "" {
+		candidate := filepath.Join(execDir, "ingestion.yaml")
+		if _, err := os.Stat(candidate); err == nil {
+			finalConfigPath = candidate
+		}
+	}
+
+	// Carrega config GitOps (se existir)
+	gitCfg, err := gitops.LoadConfigFromEnv()
+	if err != nil {
+		log.Fatalf("erro carregando configuração de GitOps: %v", err)
+	}
+	gitEnabled := gitCfg != nil
+
+	// ---------------------
+	// MODO CONFIG (wave)
+	// ---------------------
+	if finalConfigPath != "" {
+		var outBaseDir string
+		var repoPath, branchName string
+
+		if gitEnabled && !*dryRun {
+			// Prepara repo Git (clone/update + branch)
+			repoPath, branchName, err = gitops.PrepareRepo(gitCfg, execDir, *group)
+			if err != nil {
+				log.Fatalf("erro preparando repositório GitOps: %v", err)
+			}
+
+			// outDir relativo à raiz do repo (se não for absoluto)
+			if filepath.IsAbs(*outDirFlag) {
+				outBaseDir = *outDirFlag
+			} else {
+				outBaseDir = filepath.Join(repoPath, *outDirFlag)
+			}
+		} else {
+			// Sem GitOps: outDir relativo à pasta do executável (se não for absoluto)
+			if filepath.IsAbs(*outDirFlag) {
+				outBaseDir = *outDirFlag
+			} else {
+				outBaseDir = filepath.Join(execDir, *outDirFlag)
+			}
+		}
+
 		log.Printf(
-			"Iniciando modo config: configPath=%s group=%s mode=%s size=%s outDir=%s dryRun=%v maxTablesPerSource(flag)=%d maxRowsPerSource(flag)=%d",
-			*configPath, *group, *mode, *size, *outDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource,
+			"Iniciando modo config: configPath=%s group=%s mode=%s size=%s outDir=%s dryRun=%v maxTablesPerSource(flag)=%d maxRowsPerSource(flag)=%d gitEnabled=%v",
+			finalConfigPath, *group, *mode, *size, outBaseDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource, gitEnabled,
 		)
 
-		if err := runFromConfig(*configPath, *group, *mode, *size, *outDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource); err != nil {
+		if err := runFromConfig(finalConfigPath, *group, *mode, *size, outBaseDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource); err != nil {
 			log.Fatalf("erro no modo config: %v", err)
 		}
+
+		// Se GitOps estiver habilitado e não for dry-run, faz commit/push
+		if gitEnabled && !*dryRun {
+			msg := fmt.Sprintf("Ingestion wave %s", *group)
+			if err := gitops.CommitAndPush(repoPath, branchName, msg); err != nil {
+				log.Fatalf("erro ao fazer commit/push GitOps: %v", err)
+			}
+			log.Printf("GitOps concluído com sucesso. Branch: %s", branchName)
+		}
+
 		return
 	}
 
-	// Modo single (tabela única)
+	// ---------------------
+	// MODO SINGLE
+	// ---------------------
 	if *table == "" {
-		log.Fatal("flag -table é obrigatória quando -config não é informado")
+		log.Fatal("flag -table é obrigatória quando -config não é informado e não foi encontrado ingestion.yaml ao lado do binário")
+	}
+
+	// outDir relativo à pasta do executável (se não for absoluto)
+	outBaseDir := *outDirFlag
+	if !filepath.IsAbs(outBaseDir) {
+		outBaseDir = filepath.Join(execDir, outBaseDir)
 	}
 
 	log.Printf("Iniciando modo single: schema=%s table=%s group=%s mode=%s size=%s outDir=%s dryRun=%v",
-		*schema, *table, *group, *mode, *size, *outDir, *dryRun)
+		*schema, *table, *group, *mode, *size, outBaseDir, *dryRun)
 
-	if err := runSingleTable(*schema, *table, *group, *mode, *size, *outDir, *dryRun); err != nil {
+	if err := runSingleTable(*schema, *table, *group, *mode, *size, outBaseDir, *dryRun); err != nil {
 		log.Fatalf("erro no modo single: %v", err)
 	}
 }
