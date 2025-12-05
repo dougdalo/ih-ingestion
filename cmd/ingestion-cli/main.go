@@ -14,7 +14,9 @@ import (
 	"ih-ingestion/internal/config"
 	"ih-ingestion/internal/generator"
 	"ih-ingestion/internal/gitops"
+	"ih-ingestion/internal/kustomize"
 	"ih-ingestion/internal/model"
+	"ih-ingestion/internal/repo"
 	"ih-ingestion/internal/sqlserver"
 	"ih-ingestion/internal/templates"
 )
@@ -47,10 +49,10 @@ func main() {
 	configFlag := flag.String("config", "", "caminho para arquivo YAML de ingestão (vários bancos/tabelas). Se vazio, tenta ingestion.yaml ao lado do binário")
 	schema := flag.String("schema", "dbo", "schema da tabela de origem (modo single)")
 	table := flag.String("table", "", "nome da tabela de origem (modo single)")
-	group := flag.String("group", "grupo1", "nome lógico do grupo/wave de tabelas")
-	mode := flag.String("mode", "online", "modo: online ou batch")
-	size := flag.String("size", "m", "tamanho: p/m/g")
-	outDirFlag := flag.String("out", "./out", "diretório de saída para os YAMLs (se GitOps estiver habilitado, é relativo à raiz do repo)")
+	group := flag.String("group", "grupo1", "nome lógico do grupo/wave de tabelas (ex: grupo1)")
+	mode := flag.String("mode", "online", "modo: online ou batch (usado em nomes de connectors/arquivos)")
+	size := flag.String("size", "m", "tamanho: p/m/g (usado em nomes de connectors/arquivos)")
+	outDirFlag := flag.String("out", "./apps", "no modo GitOps: subpasta apps/ dentro do repo. No modo local: pasta base onde serão criadas source/sink/jobs.")
 	dryRun := flag.Bool("dry-run", false, "se verdadeiro, não grava arquivos nem faz git push; apenas mostra o que seria feito")
 
 	maxTablesPerSource := flag.Int("max-tables-per-source", 0, "máximo de tabelas por source connector (0 = ilimitado, pode ser sobrescrito por alias no YAML)")
@@ -72,13 +74,29 @@ func main() {
 	if err != nil {
 		log.Fatalf("erro carregando configuração de GitOps: %v", err)
 	}
-	gitEnabled := gitCfg != nil
+
+	// IH_GITOPS_ENABLED controla explicitamente o modo
+	gitopsFlag := strings.ToLower(strings.TrimSpace(os.Getenv("IH_GITOPS_ENABLED")))
+	var gitEnabled bool
+
+	switch gitopsFlag {
+	case "true", "1", "yes", "y":
+		if gitCfg == nil {
+			log.Fatalf("IH_GITOPS_ENABLED=true mas GIT_REPO_URL não está configurado (GitOps não pode ser usado)")
+		}
+		gitEnabled = true
+	case "false", "0", "no", "n":
+		gitEnabled = false
+	default:
+		// modo automático: se há GIT_REPO_URL, usa GitOps; senão, modo local/out
+		gitEnabled = (gitCfg != nil)
+	}
 
 	// ---------------------
-	// MODO CONFIG (wave)
+	// MODO CONFIG (waves)
 	// ---------------------
 	if finalConfigPath != "" {
-		var outBaseDir string
+		var baseDir string
 		var repoPath, branchName string
 
 		if gitEnabled && !*dryRun {
@@ -88,27 +106,27 @@ func main() {
 				log.Fatalf("erro preparando repositório GitOps: %v", err)
 			}
 
-			// outDir relativo à raiz do repo (se não for absoluto)
+			// baseDir relativo à raiz do repo (se não for absoluto)
 			if filepath.IsAbs(*outDirFlag) {
-				outBaseDir = *outDirFlag
+				baseDir = *outDirFlag
 			} else {
-				outBaseDir = filepath.Join(repoPath, *outDirFlag)
+				baseDir = filepath.Join(repoPath, *outDirFlag) // normalmente repo/apps
 			}
 		} else {
-			// Sem GitOps: outDir relativo à pasta do executável (se não for absoluto)
+			// Sem GitOps: baseDir relativo à pasta do executável (se não for absoluto)
 			if filepath.IsAbs(*outDirFlag) {
-				outBaseDir = *outDirFlag
+				baseDir = *outDirFlag
 			} else {
-				outBaseDir = filepath.Join(execDir, *outDirFlag)
+				baseDir = filepath.Join(execDir, *outDirFlag) // ex: ./out
 			}
 		}
 
 		log.Printf(
-			"Iniciando modo config: configPath=%s group=%s mode=%s size=%s outDir=%s dryRun=%v maxTablesPerSource(flag)=%d maxRowsPerSource(flag)=%d gitEnabled=%v",
-			finalConfigPath, *group, *mode, *size, outBaseDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource, gitEnabled,
+			"Iniciando modo config: configPath=%s group=%s mode=%s size=%s baseDir=%s dryRun=%v maxTablesPerSource(flag)=%d maxRowsPerSource(flag)=%d gitEnabled=%v",
+			finalConfigPath, *group, *mode, *size, baseDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource, gitEnabled,
 		)
 
-		if err := runFromConfig(finalConfigPath, *group, *mode, *size, outBaseDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource); err != nil {
+		if err := runFromConfig(finalConfigPath, *group, *mode, *size, baseDir, *dryRun, *maxTablesPerSource, *maxRowsPerSource, gitEnabled); err != nil {
 			log.Fatalf("erro no modo config: %v", err)
 		}
 
@@ -290,7 +308,16 @@ func runSingleTable(schema, table, group, mode, size, outDir string, dryRun bool
 }
 
 // Modo YAML: vários bancos/tabelas via ingestion.yaml, com agrupamento em sources
-func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, maxTablesPerSourceFlag int, maxRowsPerSourceFlag int64) error {
+// baseDir:
+//   - no GitOps: caminho da pasta apps dentro do repo
+//   - no modo local: pasta base (ex: ./out)
+func runFromConfig(
+	configPath, group, mode, size, baseDir string,
+	dryRun bool,
+	maxTablesPerSourceFlag int,
+	maxRowsPerSourceFlag int64,
+	useArgoLayout bool,
+) error {
 	cfgYaml, err := config.LoadIngestionConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("carregando config YAML: %w", err)
@@ -318,6 +345,38 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 	sfDatabase := config.GetEnvOrDefault("SNOWFLAKE_DATABASE", "LZ_SQL_IH")
 	shBootstrap := config.GetEnvOrDefault("SCHEMA_HISTORY_BOOTSTRAP_SERVERS", "kafka01:9092,kafka02:9092,kafka03:9092")
 
+	envName := config.GetEnvOrDefault("IH_ENV", "production")
+
+	layout := repo.NewLayout(baseDir, envName, "debeziumsqlserver", logicalDB, useArgoLayout)
+
+	// 🔒 Segurança de layout:
+	// - GitOps (ArgoStyle=true): roots DEVEM existir (apps/<...>), senão erro
+	// - Local/out (ArgoStyle=false): roots são criados se não existirem
+	if layout.ArgoStyle {
+		rootMap := map[string]string{
+			"sourceRoot": layout.SourceRoot(),
+			"sinkRoot":   layout.SinkRoot(),
+			"jobRoot":    layout.JobRoot(),
+		}
+
+		for name, p := range rootMap {
+			fi, err := os.Stat(p)
+			if err != nil {
+				return fmt.Errorf("layout inválido: diretório base %s não encontrado (%s): %w", name, p, err)
+			}
+			if !fi.IsDir() {
+				return fmt.Errorf("layout inválido: %s existe mas não é diretório: %s", name, p)
+			}
+		}
+	} else if !dryRun {
+		// modo local: garante que as raízes existam
+		for _, root := range []string{layout.SourceRoot(), layout.SinkRoot(), layout.JobRoot()} {
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				return fmt.Errorf("criando diretório base %s: %w", root, err)
+			}
+		}
+	}
+
 	totalTables := 0
 	totalSources := 0
 
@@ -325,7 +384,7 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 		dbNameLower := strings.ToLower(srv.Database)
 		dbNameUpper := strings.ToUpper(srv.Database)
 
-		// limites efetivos (YAML > flag > 0)
+		// limites efetivos (YAML > flag)
 		effMaxTables := maxTablesPerSourceFlag
 		if srv.MaxTablesPerSource > 0 {
 			effMaxTables = srv.MaxTablesPerSource
@@ -347,30 +406,30 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 		// Monta metadados de cada tabela (DDL + rowcount)
 		var metas []tableMeta
 		for _, t := range srv.Tables {
-			schema := srv.Schema
+			schemaName := srv.Schema
 			if strings.TrimSpace(t.Schema) != "" {
-				schema = strings.TrimSpace(t.Schema)
+				schemaName = strings.TrimSpace(t.Schema)
 			}
 
-			cols, err := sqlserver.LoadColumns(db, schema, t.Name)
+			cols, err := sqlserver.LoadColumns(db, schemaName, t.Name)
 			if err != nil {
 				db.Close()
-				return fmt.Errorf("lendo colunas %s.%s (%s): %w", schema, t.Name, srv.Alias, err)
+				return fmt.Errorf("lendo colunas %s.%s (%s): %w", schemaName, t.Name, srv.Alias, err)
 			}
 			businessDDL := sqlserver.BuildBusinessColumnsDDL(cols)
 
 			var rowCount int64
 			if effMaxRows > 0 {
-				rowCount, err = sqlserver.GetTableRowCount(db, schema, t.Name)
+				rowCount, err = sqlserver.GetTableRowCount(db, schemaName, t.Name)
 				if err != nil {
 					db.Close()
-					return fmt.Errorf("obtendo rowcount de %s.%s (%s): %w", schema, t.Name, srv.Alias, err)
+					return fmt.Errorf("obtendo rowcount de %s.%s (%s): %w", schemaName, t.Name, srv.Alias, err)
 				}
 			}
 
 			metas = append(metas, tableMeta{
 				Name:        t.Name,
-				Schema:      schema,
+				Schema:      schemaName,
 				RowCount:    rowCount,
 				BusinessDDL: businessDDL,
 			})
@@ -386,11 +445,42 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 			dbDefaultSchemaLower = "dbo"
 		}
 
+		// diretórios reais (por banco), com base no layout
+		sourceDir := layout.SourceDBDir(dbNameLower, dbDefaultSchemaLower)
+		sinkDir := layout.SinkDBDir(dbNameLower)
+		jobDir := layout.JobDBDir(dbNameLower)
+
+		if !dryRun {
+			// Aqui MkdirAll só cria a pasta do banco (bkbl001d, crmb001d, etc),
+			// pois os roots já foram validados/criados antes.
+			if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+				db.Close()
+				return fmt.Errorf("criando sourceDir %s: %w", sourceDir, err)
+			}
+			if err := os.MkdirAll(sinkDir, 0o755); err != nil {
+				db.Close()
+				return fmt.Errorf("criando sinkDir %s: %w", sinkDir, err)
+			}
+			if err := os.MkdirAll(jobDir, 0o755); err != nil {
+				db.Close()
+				return fmt.Errorf("criando jobDir %s: %w", jobDir, err)
+			}
+		}
+
+		sourceKustomFiles := []string{}
+		sinkKustomFiles := []string{}
+		jobKustomFiles := []string{}
+
 		for gi, g := range groups {
 			totalSources++
 			groupIndex := gi + 1
 
-			// Naming base pra esse grupo
+			// Nome do arquivo source dentro da pasta do banco
+			// Ex: grupo1-online-m-001.yaml
+			sourceFileName := fmt.Sprintf("%s-%s-%s-%03d.yaml", group, mode, size, groupIndex)
+			srcPath := filepath.Join(sourceDir, sourceFileName)
+
+			// Nome lógico do connector source
 			sourceName := fmt.Sprintf(
 				"source-debeziumsqlserver-%s-%s-%s-%s-%s-%03d",
 				dbNameLower, dbDefaultSchemaLower, group, mode, size, groupIndex,
@@ -414,7 +504,6 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 			}
 			port := config.GetEnvOrDefault(portEnvName, "1433")
 
-			// table.include.list com todas as tabelas desse grupo
 			includeParts := make([]string, 0, len(g.Tables))
 			for _, tm := range g.Tables {
 				includeParts = append(includeParts, fmt.Sprintf("%s.%s", tm.Schema, tm.Name))
@@ -434,8 +523,6 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 				SchemaHistoryTopic:            schemaHistoryTopic,
 			}
 
-			srcPath := fmt.Sprintf("%s/source-%s-%s-%03d.yaml", outDir, dbNameLower, dbDefaultSchemaLower, groupIndex)
-
 			logPrefix := fmt.Sprintf("[alias=%s grp=%02d db=%s]", srv.Alias, groupIndex, dbNameUpper)
 			log.Printf("%s source=%s (tables=%d, totalRows=%d) -> %s",
 				logPrefix, sourceName, len(g.Tables), g.TotalRows, srcPath)
@@ -452,15 +539,17 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 				log.Printf("%s DRY-RUN: source NÃO gravado (apenas preview)", logPrefix)
 			}
 
-			// Agora sinks e jobs por tabela (1:1)
+			sourceKustomFiles = append(sourceKustomFiles, sourceFileName)
+
+			// sinks + jobs por tabela
 			for _, tm := range g.Tables {
-				schema := tm.Schema
+				schemaName := tm.Schema
 				tableUpper := strings.ToUpper(tm.Name)
 				tableLower := strings.ToLower(tm.Name)
 
 				topicName := fmt.Sprintf(
 					"%s.%s.%s.%s",
-					topicPrefix, dbNameUpper, strings.ToUpper(schema), tableUpper,
+					topicPrefix, dbNameUpper, strings.ToUpper(schemaName), tableUpper,
 				)
 
 				sinkName := fmt.Sprintf(
@@ -472,6 +561,10 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 					size,
 					"v1",
 				)
+
+				// Exemplo: bkbl001d-clientes-online-m.yaml
+				sinkFileName := fmt.Sprintf("%s-%s-%s-%s.yaml", dbNameLower, tableLower, mode, size)
+				sinkPath := filepath.Join(sinkDir, sinkFileName)
 
 				sinkCfg := model.SinkConfig{
 					Name:                    sinkName,
@@ -487,6 +580,9 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 
 				jobName := fmt.Sprintf("lz-sql-ih-%s-%s-v1", dbNameLower, tableLower)
 				sqlConfigMapName := fmt.Sprintf("lz-sql-ih-%s-%s-sql", dbNameLower, tableLower)
+				// Exemplo: bkbl001d-clientes.yaml
+				jobFileName := fmt.Sprintf("%s-%s.yaml", dbNameLower, tableLower)
+				jobPath := filepath.Join(jobDir, jobFileName)
 
 				jobCfg := model.SnowflakeJobConfig{
 					JobName:             jobName,
@@ -501,26 +597,45 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 					BusinessColumnsDDL:  tm.BusinessDDL,
 				}
 
-				sinkPath := fmt.Sprintf("%s/sink-%s-%s.yaml", outDir, dbNameLower, tableLower)
-				jobPath := fmt.Sprintf("%s/job-snowflake-%s-%s.yaml", outDir, dbNameLower, tableLower)
-
 				log.Printf("%s sink=%s job=%s table=%s.%s -> %s , %s",
-					logPrefix, sinkName, jobName, schema, tableUpper, sinkPath, jobPath)
+					logPrefix, sinkName, jobName, schemaName, tableUpper, sinkPath, jobPath)
 
 				if dryRun {
 					log.Printf("%s DRY-RUN: sink/job NÃO gravados (apenas preview)", logPrefix)
-					continue
+				} else {
+					if err := generator.RenderToFile(templates.SinkTemplate, sinkCfg, sinkPath); err != nil {
+						db.Close()
+						return fmt.Errorf("gerando sink (%s.%s): %w", schemaName, tm.Name, err)
+					}
+					if err := generator.RenderToFile(templates.SnowflakeJobTemplate, jobCfg, jobPath); err != nil {
+						db.Close()
+						return fmt.Errorf("gerando job (%s.%s): %w", schemaName, tm.Name, err)
+					}
 				}
 
-				if err := generator.RenderToFile(templates.SinkTemplate, sinkCfg, sinkPath); err != nil {
-					db.Close()
-					return fmt.Errorf("gerando sink (%s.%s): %w", schema, tm.Name, err)
-				}
-				if err := generator.RenderToFile(templates.SnowflakeJobTemplate, jobCfg, jobPath); err != nil {
-					db.Close()
-					return fmt.Errorf("gerando job (%s.%s): %w", schema, tm.Name, err)
-				}
+				sinkKustomFiles = append(sinkKustomFiles, sinkFileName)
+				jobKustomFiles = append(jobKustomFiles, jobFileName)
 			}
+		}
+
+		if !dryRun {
+			// Source com namespace strimzi
+			if err := kustomize.UpdateKustomization(sourceDir, sourceKustomFiles, "strimzi"); err != nil {
+				db.Close()
+				return fmt.Errorf("atualizando kustomization do source em %s: %w", sourceDir, err)
+			}
+			// Sink e Jobs sem namespace (como nos teus exemplos)
+			if err := kustomize.UpdateKustomization(sinkDir, sinkKustomFiles, ""); err != nil {
+				db.Close()
+				return fmt.Errorf("atualizando kustomization do sink em %s: %w", sinkDir, err)
+			}
+			if err := kustomize.UpdateKustomization(jobDir, jobKustomFiles, ""); err != nil {
+				db.Close()
+				return fmt.Errorf("atualizando kustomization dos jobs em %s: %w", jobDir, err)
+			}
+		} else {
+			log.Printf("[alias=%s] DRY-RUN: kustomization.yaml NÃO atualizado. sourceDir=%s sinkDir=%s jobDir=%s",
+				srv.Alias, sourceDir, sinkDir, jobDir)
 		}
 
 		db.Close()
@@ -529,7 +644,7 @@ func runFromConfig(configPath, group, mode, size, outDir string, dryRun bool, ma
 	if dryRun {
 		log.Printf("DRY-RUN concluído. Sources simulados: %d | Tabelas processadas: %d", totalSources, totalTables)
 	} else {
-		log.Printf("Arquivos gerados em %s (modo config). Sources: %d | Tabelas: %d", outDir, totalSources, totalTables)
+		log.Printf("Arquivos gerados sob baseDir=%s (modo config). Sources: %d | Tabelas: %d", baseDir, totalSources, totalTables)
 	}
 
 	return nil
