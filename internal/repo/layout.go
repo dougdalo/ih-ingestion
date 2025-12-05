@@ -36,7 +36,7 @@ func NewLayout(baseDir, env, sourceProvider, snowflakeLogical string, argoStyle 
 // SourceRoot:
 //
 //   - Modo GitOps (ArgoStyle=true):
-//     apps/strimzi_conectores/envs/<env>/source/debeziumsqlserver
+//     apps/strimzi/envs/<env>/source/debeziumsqlserver
 //
 //   - Modo local/out (ArgoStyle=false):
 //     out/source/debeziumsqlserver
@@ -44,7 +44,7 @@ func (l Layout) SourceRoot() string {
 	if l.ArgoStyle {
 		return filepath.Join(
 			l.BaseDir,
-			"strimzi_conectores",
+			"strimzi",
 			"envs",
 			l.Env,
 			"source",
@@ -62,19 +62,19 @@ func (l Layout) SourceRoot() string {
 // SinkRoot:
 //
 //   - GitOps:
-//     apps/strimzi_conectores/envs/<env>/sink/jobsnowflake/<lz-sql-ih-prd>
+//     apps/strimzi_conectores/envs/<env>/sink/jdbcsnowflake/<lz-sql-ih-prd>
 //
 //   - Local:
-//     out/sink/jobsnowflake/<lz-sql-ih-prd>
+//     out/sink/jdbcsnowflake/<lz-sql-ih-prd>
 func (l Layout) SinkRoot() string {
 	if l.ArgoStyle {
 		return filepath.Join(
 			l.BaseDir,
-			"strimzi_conectores",
+			"strimzi",
 			"envs",
 			l.Env,
 			"sink",
-			"jobsnowflake",
+			"jdbcsnowflake",
 			l.SnowflakeLogical,
 		)
 	}
@@ -82,7 +82,7 @@ func (l Layout) SinkRoot() string {
 	return filepath.Join(
 		l.BaseDir,
 		"sink",
-		"jobsnowflake",
+		"jdbcsnowflake",
 		l.SnowflakeLogical,
 	)
 }
@@ -90,15 +90,15 @@ func (l Layout) SinkRoot() string {
 // JobRoot:
 //
 //   - GitOps:
-//     apps/jobs/snowflake_envs/<env>/<lz-sql-ih-prd>
+//     apps/jobs/snowflake/<env>/<lz-sql-ih-prd>
 //
 //   - Local:
-//     out/jobs/snowflake_envs/<env>/<lz-sql-ih-prd>
+//     out/jobs/snowflake/<env>/<lz-sql-ih-prd>
 func (l Layout) JobRoot() string {
 	return filepath.Join(
 		l.BaseDir,
 		"jobs",
-		"snowflake_envs",
+		"snowflake",
 		l.Env,
 		l.SnowflakeLogical,
 	)
@@ -143,10 +143,10 @@ func (l Layout) SinkDBDir(dbNameLower string) string {
 // Diretório dos JOBS Snowflake para um banco:
 //
 //   - GitOps:
-//     apps/jobs/snowflake_envs/<env>/<lz-sql-ih-prd>/<db>/
+//     apps/jobs/snowflake/<env>/<lz-sql-ih-prd>/<db>/
 //
 //   - Local:
-//     out/jobs/snowflake_envs/<env>/<lz-sql-ih-prd>/<db>/
+//     out/jobs/snowflake/<env>/<lz-sql-ih-prd>/<db>/
 func (l Layout) JobDBDir(dbNameLower string) string {
 	dbSlug := strings.ToLower(dbNameLower)
 
