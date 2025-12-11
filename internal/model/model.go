@@ -22,6 +22,7 @@ type SourceConfig struct {
 	TableIncludeList              string
 	SchemaHistoryBootstrapServers string
 	SchemaHistoryTopic            string
+	SchemaRegistryURL             string
 }
 
 type SinkConfig struct {

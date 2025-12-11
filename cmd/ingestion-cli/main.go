@@ -179,6 +179,10 @@ func runSingleTable(schema, table, group, mode, size, outDir string, dryRun bool
 	businessDDL := sqlserver.BuildBusinessColumnsDDL(cols)
 
 	clusterName := config.GetEnvOrDefault("CONNECT_CLUSTER_NAME", "inthub-prd")
+	schemaRegistryURL := config.GetEnvOrDefault(
+		"SCHEMA_REGISTRY_URL",
+		"http://schema-registry-ih.kafka-admin:8081",
+	)
 
 	dbNameLower := strings.ToLower(dbName)
 	dbNameUpper := strings.ToUpper(dbName)
@@ -218,6 +222,7 @@ func runSingleTable(schema, table, group, mode, size, outDir string, dryRun bool
 		TableIncludeList:              fmt.Sprintf("%s.%s", schema, table),
 		SchemaHistoryBootstrapServers: shBootstrap,
 		SchemaHistoryTopic:            schemaHistoryTopic,
+		SchemaRegistryURL:             schemaRegistryURL,
 	}
 
 	// Sink / Snowflake
@@ -344,6 +349,10 @@ func runFromConfig(
 	role := config.GetEnvOrDefault("SNOWFLAKE_ROLE", "SNFLK_INTEGRATION_HUB_ROLE")
 	sfDatabase := config.GetEnvOrDefault("SNOWFLAKE_DATABASE", "LZ_SQL_IH")
 	shBootstrap := config.GetEnvOrDefault("SCHEMA_HISTORY_BOOTSTRAP_SERVERS", "kafka01:9092,kafka02:9092,kafka03:9092")
+	schemaRegistryURL := config.GetEnvOrDefault(
+		"SCHEMA_REGISTRY_URL",
+		"http://schema-registry-ih.kafka-admin:8081",
+	)
 
 	envName := config.GetEnvOrDefault("IH_ENV", "production")
 
@@ -521,6 +530,7 @@ func runFromConfig(
 				TableIncludeList:              tableIncludeList,
 				SchemaHistoryBootstrapServers: shBootstrap,
 				SchemaHistoryTopic:            schemaHistoryTopic,
+				SchemaRegistryURL:             schemaRegistryURL,
 			}
 
 			logPrefix := fmt.Sprintf("[alias=%s grp=%02d db=%s]", srv.Alias, groupIndex, dbNameUpper)

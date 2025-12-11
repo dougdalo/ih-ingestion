@@ -16,6 +16,7 @@ spec:
   class: io.debezium.connector.sqlserver.SqlServerConnector
   tasksMax: 1
   config:
+    # Conexão com SQL Server
     database.hostname: "{{ .DatabaseHost }}"
     database.port: "{{ .DatabasePort }}"
     database.user: "${secrets:{{ .DatabaseSecret }}:user}"
@@ -23,21 +24,29 @@ spec:
     database.names: "{{ .DatabaseNameUpper }}"
     database.encrypt: false
 
+    # Tópicos e tabelas
     topic.prefix: "{{ .TopicPrefix }}"
     table.include.list: "{{ .TableIncludeList }}"
 
+    # Regras de tipos / tombstones
     decimal.handling.mode: "string"
     tombstones.on.delete: false
 
-    schema.history.internal.kafka.bootstrap.servers: {{ .SchemaHistoryBootstrapServers }}
+    # Schema history interno do Debezium
+    schema.history.internal.kafka.bootstrap.servers: "{{ .SchemaHistoryBootstrapServers }}"
     schema.history.internal.kafka.topic: "{{ .SchemaHistoryTopic }}"
 
-    value.converter: "org.apache.kafka.connect.json.JsonConverter"
-    key.converter: "org.apache.kafka.connect.json.JsonConverter"
+    # Converters (Avro) + Schema Registry
+    value.converter: "io.confluent.connect.avro.AvroConverter"
+    key.converter: "io.confluent.connect.avro.AvroConverter"
     key.converter.schemas.enable: "false"
     value.converter.schemas.enable: "true"
+    key.converter.schema.registry.url: "{{ .SchemaRegistryURL }}"
+    value.converter.schema.registry.url: "{{ .SchemaRegistryURL }}"
 
+    # Modo de snapshot e leitura
     data.query.mode: direct
+    snapshot.mode: "when_needed"
     snapshot.locking.mode: none
     snapshot.isolation.mode: read_committed
     snapshot.max.threads: 5
