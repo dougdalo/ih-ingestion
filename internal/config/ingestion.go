@@ -14,11 +14,13 @@ type TableEntry struct {
 }
 
 type SqlServerEntry struct {
-	Alias      string       `yaml:"alias"`
-	Database   string       `yaml:"database"`
-	Schema     string       `yaml:"schema"`     // schema default
-	SecretName string       `yaml:"secretName"` // nome do secret usado no connector
-	Tables     []TableEntry `yaml:"tables"`
+	Alias              string       `yaml:"alias"`
+	Database           string       `yaml:"database"`
+	Schema             string       `yaml:"schema"`     // schema default
+	SecretName         string       `yaml:"secretName"` // nome do secret usado no connector
+	MaxTablesPerSource int          `yaml:"maxTablesPerSource,omitempty"`
+	MaxRowsPerSource   int64        `yaml:"maxRowsPerSource,omitempty"`
+	Tables             []TableEntry `yaml:"tables"`
 }
 
 type IngestionConfig struct {
@@ -75,6 +77,13 @@ func ValidateIngestionConfig(cfg *IngestionConfig) error {
 
 		if len(srv.Tables) == 0 {
 			problems = append(problems, ctx+": nenhuma tabela configurada em tables")
+		}
+
+		if srv.MaxTablesPerSource < 0 {
+			problems = append(problems, ctx+": maxTablesPerSource não pode ser negativo")
+		}
+		if srv.MaxRowsPerSource < 0 {
+			problems = append(problems, ctx+": maxRowsPerSource não pode ser negativo")
 		}
 
 		defaultSchema := "dbo"
