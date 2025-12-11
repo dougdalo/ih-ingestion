@@ -1,0 +1,56 @@
+# =========================================
+# 🟦 Go - binários e builds
+# =========================================
+# Binários gerados pelo go build / go test
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Pastas de build / releases locais
+bin/
+build/
+dist/
+releases/
+release/
+
+# Binários gerados do serviço ih-ingestion
+/ih-ingestion        # binário principal
+/ih-ingestion-v*     # todas as versões: -v1.0, -v1.0.1, etc
+
+# Cache do Go
+*.prof
+*.pprof
+
+# Módulos vendorizados (se você não quer commitar vendor)
+vendor/
+
+# =========================================
+# 🔐 Configurações sensíveis
+# =========================================
+.env
+.env.*
+config.yaml
+config.yml
+
+# Se tiver outros arquivos de config locais
+*.local.yaml
+*.local.yml
+
+# =========================================
+# 💻 IDEs - GoLand / JetBrains / outros
+# =========================================
+.idea/
+*.iml
+
+# VS Code (se usar também)
+.vscode/
+
+# =========================================
+# 🧹 Sistema operacional
+# =========================================
+.DS_Store
+Thumbs.db
